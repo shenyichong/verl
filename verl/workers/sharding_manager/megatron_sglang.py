@@ -204,7 +204,8 @@ class MegatronSGLangShardingManager(BaseShardingManager):
         # add empty cache after each compute
         aggressive_empty_cache(force_sync=True)
 
-        set_expandable_segments(True)
+        set_expandable_segments(False)
+        #set_expandable_segments(True)
 
         # restore random states
         if self.device_mesh is not None:
