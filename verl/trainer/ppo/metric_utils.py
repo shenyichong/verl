@@ -333,7 +333,9 @@ def compute_throughout_metrics(
     """
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
-
+    # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
+    # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
+    # f'Theoretical TFLOPs/s/GPU​': promised_flops,
     metrics = {
         "perf/total_num_tokens": total_num_tokens,
         "perf/time_per_step": time,
