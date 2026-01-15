@@ -41,7 +41,6 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role
-from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import (
@@ -94,7 +93,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 self.role_worker_mapping[Role.RefPolicy],
                 config=self.config.actor_rollout_ref,
                 role=str(Role.RefPolicy),
-                profile_option=self.config.trainer.npu_profile.options,
+                # profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 
@@ -336,7 +335,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         return batch
 
-    def _process_batch_common(self, batch, metrics, timing_raw):
+    def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None):
         with marked_timer("reward", timing_raw, color="yellow"):
             # compute reward model score
             if self.use_rm:
@@ -348,29 +347,51 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             else:
                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-        # recompute old_log_probs
         with marked_timer("old_log_prob", timing_raw, color="blue"):
-            async_training = self.config.get("async_training", None)
-            if async_training and async_training.use_rollout_log_probs:
-                batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-            else:
+            def compute_old_log_prob(batch):
                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                 entropys = old_log_prob.batch["entropys"]
                 response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                actor_config = self.config.actor_rollout_ref.actor
+                entropy_agg = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=response_masks,
+                    loss_agg_mode=actor_config.loss_agg_mode,
+                    loss_scale_factor=actor_config.loss_scale_factor,
+                )
                 old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                 metrics.update(old_log_prob_metrics)
                 old_log_prob.batch.pop("entropys")
                 batch = batch.union(old_log_prob)
-
                 if "rollout_log_probs" in batch.batch.keys():
                     # TODO: we may want to add diff of probs too.
                     from verl.utils.debug.metrics import calculate_debug_metrics
 
                     metrics.update(calculate_debug_metrics(batch))
+                return batch
+
+            async_training = self.config.get("async_training", None)
+            if async_training and async_training.use_rollout_log_probs:
+                # If local_triger_step == 1, load the training engine's parameters to the CPU
+                #  and save a copy for subsequent MIS use.
+                # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+                # then restore the parameters of the current version.
+                if local_trigger_step == 1:
+                    self.actor_rollout_wg.save_model_to_cpu(1)
+                    batch = compute_old_log_prob(batch)
+                elif local_trigger_step is not None:
+                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                    self.actor_rollout_wg.restore_model_from_cpu(1)
+                    batch = compute_old_log_prob(batch)
+                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                else:
+                    batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+            else:
+                batch = compute_old_log_prob(batch)
 
         if self.use_reference_policy:
             # compute reference log_prob
@@ -406,8 +427,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             else:
                 batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-            # compute advantages, executed on the driver process
+            # Compute rollout correction weights centrally (once per batch)
+            # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
+            # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
+            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                # IS and off-policy metrics already have rollout_corr/ prefix
+                metrics.update(is_metrics)
+
+            # compute advantages, executed on the driver process
             norm_adv_by_std_in_grpo = self.config.algorithm.get(
                 "norm_adv_by_std_in_grpo", True
             )  # GRPO adv normalization factor
@@ -476,27 +507,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     last_val_metrics = val_metrics
             metrics.update(val_metrics)
             return last_val_metrics
-
-    def _check_save_checkpoint(self, is_last_step, timing_raw):
-        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-        esi_close_to_expiration = should_save_ckpt_esi(
-            max_steps_duration=self.max_steps_duration,
-            redundant_time=self.config.trainer.esi_redundant_time,
-        )
-        # Check if the conditions for saving a checkpoint are met.
-        # The conditions include a mandatory condition (1) and
-        # one of the following optional conditions (2/3/4):
-        # 1. The save frequency is set to a positive value.
-        # 2. It's the last training step.
-        # 3. The current step number is a multiple of the save frequency.
-        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-        if self.config.trainer.save_freq > 0 and (
-            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
-        ):
-            if esi_close_to_expiration:
-                print("Force saving checkpoint: ESI instance expiration approaching.")
-            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                self._save_checkpoint()
 
     def _collect_metrics(self, batch, epoch, metrics, timing_raw):
         steps_duration = timing_raw["step"]

@@ -15,6 +15,8 @@
 Utilities to create common models from huggingface
 """
 
+import json
+import os
 import re
 import warnings
 from dataclasses import dataclass
@@ -22,11 +24,13 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tensordict.tensorclass import NonTensorData
 from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
@@ -529,7 +533,7 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
 
 
-def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False):
+def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False, prefix=""):
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.serialization import StrictHandling
 
@@ -538,7 +542,7 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
     for model in parallel_model:
-        ssd = unwrap_model(model).sharded_state_dict()
+        ssd = unwrap_model(model).sharded_state_dict(prefix=prefix)
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
@@ -671,14 +675,20 @@ def get_hf_auto_model_class(hf_config):
                 actor_module_class = AutoModelForVision2Seq
             case "AutoModelForCausalLM":
                 actor_module_class = AutoModelForCausalLM
+            case "AutoModelForImageTextToText":
+                actor_module_class = AutoModelForImageTextToText
             case _:
                 actor_module_class = AutoModel
     else:
         actor_module_class = AutoModel
-        for key, cls in _architecture_to_auto_class.items():
-            if key in hf_config.architectures[0]:
-                actor_module_class = cls
-                break
+        # For VLM models, we use type to check instead of architecture
+        if type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
+            actor_module_class = AutoModelForImageTextToText
+        else:
+            for key, cls in _architecture_to_auto_class.items():
+                if key in hf_config.architectures[0]:
+                    actor_module_class = cls
+                    break
 
     return actor_module_class
 
@@ -707,6 +717,10 @@ def extract_multi_modal_inputs(
         selected_batch_data = [batch_data[i] for i in indices if i < len(batch_data)]
 
     for inputs in selected_batch_data:
+        inputs = inputs.data if isinstance(inputs, NonTensorData) else inputs
+        # Mixed pure text and multi-modal dataset.
+        if inputs is None:
+            continue
         if "image_bound" in inputs:
             has_image_bound = True
         for key, value in inputs.items():
@@ -722,6 +736,41 @@ def extract_multi_modal_inputs(
             multi_modal_inputs[key] = torch.cat(values, dim=0)
 
     return multi_modal_inputs
+
+
+def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
+    """
+    Extract LoRA rank from adapter configuration file.
+
+    Args:
+        adapter_path: Path to LoRA adapter directory
+
+    Returns:
+        LoRA rank value from adapter_config.json
+
+    Raises:
+        FileNotFoundError: If adapter path or config file doesn't exist
+        ValueError: If config file is invalid or missing rank
+    """
+    adapter_path = os.path.abspath(os.path.expanduser(str(adapter_path)))
+
+    if not os.path.exists(adapter_path):
+        raise FileNotFoundError(f"LoRA adapter path not found: {adapter_path}")
+
+    config_path = os.path.join(adapter_path, "adapter_config.json")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"adapter_config.json not found in {adapter_path}")
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+            if "r" not in config:
+                raise ValueError(f"LoRA rank 'r' not found in {config_path}")
+            return int(config["r"])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {config_path}: {e}") from e
+    except (KeyError, ValueError) as e:
+        raise ValueError(f"Cannot parse LoRA rank from {config_path}: {e}") from e
 
 
 @dataclass

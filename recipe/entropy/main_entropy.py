@@ -36,7 +36,6 @@ def run_ppo(config) -> None:
                 "TOKENIZERS_PARALLELISM": "true",
                 "NCCL_DEBUG": "WARN",
                 "VLLM_LOGGING_LEVEL": "WARN",
-                "WANDB_API_KEY": "YOUR_WANDB_API_KEY",
             }
         }
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
@@ -207,9 +206,9 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, max_samples
     from verl.utils.dataset.rl_dataset import RLHFDataset
 
     if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
-        from verl.utils.import_utils import load_extern_type
+        from verl.utils.import_utils import load_extern_object
 
-        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
+        dataset_cls = load_extern_object(data_config.custom_cls.path, data_config.custom_cls.name)
         if not issubclass(dataset_cls, Dataset):
             raise TypeError(
                 f"The custom dataset class '{data_config.custom_cls.name}' from '{data_config.custom_cls.path}' "

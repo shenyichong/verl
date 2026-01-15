@@ -18,6 +18,8 @@ import time
 import ray
 from ray.util.collective import collective
 
+from verl.utils.device import get_nccl_backend
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,6 +52,9 @@ class ParameterSynchronizer:
         self._init_weights_info()
         self._init_sync_group()
 
+        if self.config.async_training.checkpoint_engine.enable:
+            self._init_actor_rollout_checkpoint_engine()
+
     def get_current_param_version(self) -> int:
         """Get current parameter version number"""
         return self.current_version
@@ -69,8 +74,24 @@ class ParameterSynchronizer:
             actor_rollout_workers,
             len(actor_rollout_workers),
             list(range(0, len(actor_rollout_workers))),
-            backend="nccl",
+            backend=get_nccl_backend(),
             group_name=self.sync_group_name,
+        )
+
+    def _init_actor_rollout_checkpoint_engine(self):
+        ray.get(
+            self.actor_wg.init_checkpoint_engine(
+                rank_offset=0,
+                actor_num=len(self.actor_wg.workers),
+                rollout_num=len(self.rollout_wg.workers),
+            )
+        )
+        ray.get(
+            self.rollout_wg.init_checkpoint_engine(
+                rank_offset=len(self.actor_wg.workers),
+                actor_num=len(self.actor_wg.workers),
+                rollout_num=len(self.rollout_wg.workers),
+            )
         )
 
     def sync_weights(self, version, validate=False, global_steps=0):
@@ -78,19 +99,26 @@ class ParameterSynchronizer:
         start_time = time.time()
 
         self.current_version = version
-        print(f"[ParameterSynchronizer] Starting weight synchronization (version {self.current_version})...")
-
         ray.get(self.rollouter.pause.remote())
 
+        print(f"[ParameterSynchronizer] rollout paused. cost {time.time() - start_time:.2f} seconds")
         # Update MQ version
         self.mq_client.update_param_version_sync(version)
 
-        # sync weights
-        self.actor_wg.sync_rollout_weights()
-        ray.get(self.rollout_wg.sync_rollout_weights())
-        end_time = time.time()
-        print(f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds")
+        pause_time = time.time()
 
+        # sync weights
+        if self.config.async_training.checkpoint_engine.enable:
+            self.actor_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name)
+            ray.get(self.rollout_wg.sync_rollout_weights_by_checkpoint(self.sync_group_name))
+        else:
+            self.actor_wg.sync_rollout_weights(self.sync_group_name)
+            ray.get(self.rollout_wg.sync_rollout_weights(self.sync_group_name))
+        end_time = time.time()
+        print(
+            f"[ParameterSynchronizer] sync_weights success. cost {end_time - start_time:.2f} seconds, "
+            f"pause:{pause_time - start_time:.2f}s, sync:{end_time - pause_time:.2f}s"
+        )
         # Async Update rollout version & validation
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
         self.wait_last_resume = self.rollouter.resume.remote(self.wait_last_update)
@@ -103,3 +131,8 @@ class ParameterSynchronizer:
         if self.wait_last_resume:
             ray.get(self.wait_last_resume)
         print(f"[ParameterSynchronizer] Wait last validate cost: {time.time() - start_time:.2f} seconds")
+
+    def rollouter_save_checkpoint(self, local_global_step_folder: str):
+        """Trigger rollout to save checkpoint(dataloader)"""
+        print(f"[ParameterSynchronizer] Triggering checkpoint save at {local_global_step_folder} ...")
+        return ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
