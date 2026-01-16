@@ -215,6 +215,9 @@ class RolloutConfig(BaseConfig):
 
     enable_sleep_mode: bool = True
 
+    profile:bool = False
+
+
     def __post_init__(self):
         """Validate the rollout config"""
         if self.expert_parallel_size > 1:

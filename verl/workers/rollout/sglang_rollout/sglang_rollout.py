@@ -152,6 +152,37 @@ class ServerAdapter(BaseRollout):
             await self._init_server_adapter()
             await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
 
+    async def start_profile(self, tags:dict[str] = None):
+        if self.device_mesh["infer_tp"].get_local_rank() == 0 \
+            and self.device_mesh["dp"].get_local_rank() == 0: # TODO: if other rank?
+            assert tags.get("activities") is not None, "Please specify the activities to profile."
+            await self._init_server_adapter()
+            # await self._engine.start_profile(tags=tags)
+            response = await self._engine.start_profile(tags=tags)
+            if response != {}:
+                # response: {'content_type': '', 'text': 'Start profiling.\n'}
+                self.profiling = True
+                self.rollout_profile_auto_stop = tags.get("num_steps", None) is not None 
+                if "MEM" in tags.get("activities"):
+                    assert not self.rollout_profile_auto_stop,  \
+                        "Manually stop profile is need for exporting memory snapshot."
+            print(f"[{id(self)}] start profile done.", response)
+            return response
+
+    async def stop_profile(self):
+        if self.device_mesh["infer_tp"].get_local_rank() == 0 \
+            and self.device_mesh["dp"].get_local_rank() == 0:
+            print(f"[{id(self)}]try to stoping profile.",  not self.profiling , self.rollout_profile_auto_stop)
+            if not self.profiling or self.rollout_profile_auto_stop:
+                return None
+            await self._init_server_adapter()
+            # await self._engine.stop_profile()
+            response = await self._engine.stop_profile()
+            if response != {}:
+                self.profiling = False
+            print("stop profile done.",response)
+            return response
+
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """
         Update model weights using tensor buckets, similar to THUDM/slime's implementation.

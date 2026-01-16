@@ -41,7 +41,7 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.replica import LoadOutput, RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter, _set_envs_and_config
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
 
@@ -284,6 +284,15 @@ class SGLangHttpServer:
             token_ids = output["output_ids"]
             log_probs = None
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+
+    async def get_load(self) -> LoadOutput:
+        output = await self.tokenizer_manager.get_load()
+        if output is not None:
+            return LoadOutput(dp_rank=output[0].dp_rank,
+                            num_reqs=output[0].num_reqs, 
+                            num_waiting_reqs=output[0].num_waiting_reqs,
+                            num_tokens=output[0].num_tokens)
+        return None
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)

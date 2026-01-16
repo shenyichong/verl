@@ -40,6 +40,16 @@ class TokenOutput(BaseModel):
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
 
+class LoadOutput(BaseModel):
+    rid: Optional[int] = None
+    http_worker_ipc: Optional[str] = None
+    dp_rank: Optional[int] = None
+    num_reqs: Optional[int] = 0
+    """"Number of requests in running_batch and waiting_queue"""
+    num_waiting_reqs: Optional[int] = 0
+    """Number of requests in waiting_queue, prefill/decode queue if use PD Disaggregation Mode"""
+    num_tokens: Optional[int] = 0
+    """Tokens in waiting queue, bootstrap queue, prealloc queue"""
 
 class RolloutMode(Enum):
     # Rollout engine and training engine(fsdp/megatron) fused in same process

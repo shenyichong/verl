@@ -38,6 +38,8 @@ class BaseRollout(ABC):
         self.config = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         self.device_mesh = device_mesh
+        self.profiling: bool = False
+        self.rollout_profile_auto_stop: bool = False
 
     @abstractmethod
     async def resume(self, tags: list[str]):

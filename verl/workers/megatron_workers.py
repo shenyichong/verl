@@ -675,6 +675,23 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
+        if self.config.rollout.profile: 
+            # Stop profiling to record the complete process
+            await self.rollout.stop_profile()
+            """
+            TODO: 1. Adapt to vLLM integration
+                  2. Add memory profiling arguments: "profile_memory=True" (not yet supported by SGLang)
+                  3. Include training step information in profile files (not supported in old VeRL version, such as October, 2025)
+            """
+            tags = {
+                "start_step": 1,
+                "num_steps":5,
+                "activities": ["CPU", "GPU"],# "CPU", "GPU", "MEM", "CUDA_PROFILER", "RPD"
+                "with_stack": True,
+                "record_shapes": True
+            }
+            await self.rollout.start_profile(tags=tags)
+
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
         if self.bridge is not None:

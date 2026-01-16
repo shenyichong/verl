@@ -56,6 +56,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+from verl.utils.profiler.config import ProfilerConfig, TorchMemoryToolConfig, TorchProfilerToolConfig
 
 __all__ = ["MegatronPPOActor"]
 
@@ -131,12 +132,9 @@ class MegatronPPOActor(BasePPOActor):
         self.actor_module = actor_module
         self.actor_optimizer: DistributedOptimizer = actor_optimizer
         self.use_torch_profiler = self.config.profiler.get("tool") == "torch"
-        if self.use_torch_profiler:
-            self.prof = Profiler(
-                self.config.profiler, tool_config=self.config.profiler.get("tool_config", {}).get("torch", {})
-            )
-        else:
-            self.prof = None
+        self.profile_update_policy = self.config.profiler.get("tool_config", {}).get("torch", {}).get("profile_update_policy", None)
+        self._forece_enable_for_one_step = self.use_torch_profiler and self.profile_update_policy
+        self.gstep = 1
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
         if self.use_fused_kernels and not getattr(self.config, "overlap_moe_expert_parallel_comm", False):
             # do not patch if overlap_moe_expert_parallel_comm is enabled
@@ -738,8 +736,16 @@ class MegatronPPOActor(BasePPOActor):
 
         """
         metrics = {}
-        if self.use_torch_profiler and self.prof and self.prof.enable:
-            self.prof.start()
+        if self._forece_enable_for_one_step:
+            # TODO: check if need rebuild this after switch mode?
+            # logger.debug("update_policy starting ... ")
+            prof= Profiler(
+                self.config.profiler, tool_config=TorchProfilerToolConfig(step_start=1, step_end=2),
+                forece_enable_for_one_step=True,
+                step=self.gstep
+            )
+            self.gstep+=1
+            prof.start()
         for data in dataloader:
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
@@ -779,16 +785,16 @@ class MegatronPPOActor(BasePPOActor):
                 pass
             else:
                 raise NotImplementedError
-            if self.use_torch_profiler and self.prof and self.prof.enable:
-                self.prof.step()
+            if self._forece_enable_for_one_step:
+                prof.step()
 
             if self.config.router_replay.mode in ["R2", "R3"]:
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
 
         # add empty cache after each compute
-        if self.use_torch_profiler and self.prof and self.prof.enable:
-            self.prof.stop_and_save()
-            self.prof.stop_trace()
+        if self._forece_enable_for_one_step:
+            prof.stop_and_save()
+            prof.stop_trace()
         get_torch_device().empty_cache()
         return metrics

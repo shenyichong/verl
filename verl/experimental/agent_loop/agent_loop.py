@@ -50,7 +50,7 @@ from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-
+ROLLOUT_SERVER_SERIAL = 0
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
@@ -76,6 +76,93 @@ class AsyncLLMServerManager:
 
         # LRU cache to map request_id to server
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
+
+        self.load_records: dict[str, dict[str, list[int]]] = {str(idx):{'num_reqs':[],
+                                                   'num_waiting_reqs':[],
+                                                   'num_tokens':[],
+                                                   'time_samples':[]
+                                                   } for idx, _ in enumerate(self.server_handles)}
+        self._interval = 1000 # ms
+        global ROLLOUT_SERVER_SERIAL
+        self._records_dump_file = f"/root/workpath/verl/examples/grpo_trainer/fruit/dump_rollout_loads/rollout_balance_records_{ROLLOUT_SERVER_SERIAL}.json"
+        ROLLOUT_SERVER_SERIAL += 1
+        import threading
+        self._stop_event = threading.Event() 
+        self._recorder_started = False 
+        self._recorder_handle = None
+
+    async def recorder(self):
+        import time
+        # get load and record every time interval
+        while not self._stop_event.is_set():
+            await self._balancing_choose_server()
+            await asyncio.sleep(self._interval / 1000)
+
+    def recorder_func(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self.recorder())
+        finally:
+            loop.close()
+
+    def start_recorder(self):
+        if self._recorder_started:
+            return
+        
+        import threading
+        self._recorder_handle = threading.Thread(target=self.recorder_func, args=())
+        self._recorder_handle.start()
+        self._recorder_started = True
+        logger.info("Recorder for rollout balance started successfully.")
+    
+    def stop_recorder(self):
+        if not self._recorder_started:
+            return
+        self._stop_event.set()
+        self._recorder_handle.join(timeout=5)
+        self._recorder_started = False
+        logger.info("Recorder for rollout balance stopped successfully.")
+
+    async def _balancing_choose_server(self) -> ray.actor.ActorHandle:
+        '''Temp. for getting loads from all engines, and dump the records into file every time interval.
+        '''
+        import time
+        if len(self.load_records[str(0)]['time_samples']) > 0 \
+            and time.time_ns() / 10**6 - self.load_records[str(0)]['time_samples'][-1] < self._interval:
+            return None
+        logger.debug("dumping rollout balance ... ", len(self.server_handles))
+        time_samples = time.time_ns() / 10**6
+        load_servers = []
+        for idx, server in enumerate(self.server_handles):
+            try:
+                out = await server.get_load.remote()
+                self.load_records[str(idx)]['num_reqs'].append(out.num_reqs)
+                self.load_records[str(idx)]['num_waiting_reqs'].append(out.num_waiting_reqs)
+                self.load_records[str(idx)]['num_tokens'].append(out.num_tokens)
+            except Exception as e:
+                logger.warning(f"Failed to get load from server {idx} {server}: {e}, filled with invalid data -1.")
+                self.load_records[str(idx)]['num_reqs'].append(-1)
+                self.load_records[str(idx)]['num_waiting_reqs'].append(-1)
+                self.load_records[str(idx)]['num_tokens'].append(-1)
+                break
+            self.load_records[str(idx)]['time_samples'].append(time_samples)
+
+            # may choose server by the number of total tokens.
+            load_servers.append((out.num_tokens, server))
+            
+        import json
+        with open(self._records_dump_file, 'w+') as f:
+            json.dump(self.load_records, f)
+
+
+        # if len(load_servers) == 0:
+        #     return None
+        # _weighted_servers = [(load, 0, server) for load, server in load_servers]
+        # heapq.heapify(_weighted_servers)
+        # the_one =  _weighted_servers[0]
+        logger.debug("Recorder for rollout balance saved:", self._records_dump_file)
+        return None # the_one
 
     def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
         # TODO: implement server pressure awareness load balancing
@@ -107,6 +194,7 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput: token output
         """
+        # self.start_recorder()
         server = self._choose_server(request_id)
         output = await server.generate.remote(
             request_id=uuid4().hex,  # use new request_id for each turn
@@ -828,7 +916,7 @@ class AgentLoopManager:
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
-
+        print("Agent loop Mannager generate_sequence time", timing)
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 

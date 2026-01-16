@@ -43,6 +43,8 @@ class TorchProfilerToolConfig(BaseConfig):
 
     step_start: int = -1
     step_end: int = -1
+    profile_update_policy: bool = False
+    profile_memory: bool = False
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
@@ -99,6 +101,42 @@ class NPUToolConfig(NsightToolConfig):
         assert self.level in ["level_none", "level0", "level1", "level2"], (
             f"Profiler level only supports level0, 1, 2, and level_none, but gets {self.level}"
         )
+
+@dataclass
+class SglangRolloutToolConfig(BaseConfig):
+    """Sglang rollout tool config."""
+    # output_dir: Optional[str] = None # use SGLANG_TORCH_PROFILER_DIR instead.
+
+    # Step to start profiling
+    start_step: Optional[int] = None
+    
+    # Number of steps to profile
+    num_steps: Optional[int] = None
+
+    # Types of profiling activities: "MEM", "CPU", "GPU", "CUDA_PROFILER", "RPD"
+    activities: Optional[list[str]] = None 
+    
+    # Enable profiling by stages
+    profile_by_stage: bool = False
+    
+    # Include stack traces in profiling
+    with_stack: Optional[bool] = None
+    
+    # Record tensor shapes in profiling
+    record_shapes: Optional[bool] = None
+    
+    # Unique identifier for the profiling session
+    profile_id: Optional[str] = None
+    
+    # Merge profiles from all ranks into a single trace
+    merge_profiles: bool = False
+
+    def __post_init__(self) -> None:
+        """config validation logics go here"""
+        assert self.activities is not None, "Please specify the activities to profile."
+        if "MEM" in self.activities:
+            assert self.num_steps is None,  \
+                "Manually stop profile is need for exporting memory snapshot, num_steps should not be set."
 
 
 @dataclass

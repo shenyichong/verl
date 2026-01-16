@@ -40,7 +40,8 @@ class Profiler:
         config: Configuration object containing profiling parameters
     """
 
-    def __init__(self, config: ProfilerConfig, tool_config: Optional[TorchProfilerToolConfig] = None):
+    def __init__(self, config: ProfilerConfig, tool_config: Optional[TorchProfilerToolConfig] = None, 
+                 step:int=1, forece_enable_for_one_step:bool=False):
         # note : if we do not set use_profile, it will be set as None, so that all function will be skip
         if not config:
             config = ProfilerConfig(ranks=[], enable=False)
@@ -48,15 +49,24 @@ class Profiler:
             assert not config.enable, "tool_config must be provided when profiler is enabled"
         self.prof = None
         self.saved = False
-        self.enable = config.enable
-        if not config.enable:
+        self.enable = config.enable or forece_enable_for_one_step
+
+        self._forece_enable_for_one_step = forece_enable_for_one_step
+        self._global_step = step
+        if not config.enable and not self._forece_enable_for_one_step:
             return
         self.config = config
         self.tool_config = tool_config
         self.rank = torch.distributed.get_rank()
+
+        self.profile_ranks = self.config.tool_config.get("torch").get("profile_ranks", None)
+        self.profile_update_policy = self.config.tool_config.get("torch").get("profile_update_policy", None)
+        self.profile_memory = True if self.config.tool_config.get("torch").get("profile_memory", None) else False
+        if self.profile_update_policy and not self._forece_enable_for_one_step:
+            return
         # we need to validate the config before using the profiler
         self._validate()
-        if self.rank in self.config.profile_ranks:
+        if self.rank in self.profile_ranks:
             print(f"[Profiler] Profiler init for rank {self.rank}")
 
             self.prof = torch.profiler.profile(
@@ -66,19 +76,20 @@ class Profiler:
                 ],
                 schedule=torch.profiler.schedule(
                     wait=max(self.tool_config.step_start - 1, 0),
-                    warmup=1 if self.tool_config.step_start > 0 else 0,
+                    warmup=1 if self.tool_config.step_start > 0 and not self._forece_enable_for_one_step else 0,
                     active=self.tool_config.step_end - self.tool_config.step_start,
                     repeat=1,
                 ),
+                profile_memory=self.profile_memory,
                 record_shapes=True,
                 with_stack=True,
             )
 
     def _validate(self):
         if self.enable:
-            if self.config.profile_ranks is None:
+            if self.profile_ranks is None:
                 print("[WARNING] Profile ranks is not set, default to rank 0")
-                self.config.profile_ranks = [0]
+                self.profile_ranks = [0]
             assert self.tool_config.step_start >= 0, "[ERROR] Profile step start must be greater than 0"
             assert self.tool_config.step_end >= 0, "[ERROR] Profile step end must be greater than 0"
             assert self.tool_config.step_start < self.tool_config.step_end, (
@@ -88,27 +99,46 @@ class Profiler:
     def check(self):
         return self.prof is not None and self.enable
 
-    def start(self):
+    def start(self, *args, **kwargs):
         if self.check():
             print(f"[Profiler] started for rank {self.rank}")
             self.prof.start()
 
     def step(self):
         if self.check():
+            print(f"[Profiler] step for rank {self.rank}")
             self.prof.step()
 
-    def stop(self):
+    def stop(self, *args, **kwargs):
         if self.check():
+            if not self._forece_enable_for_one_step:
+                self.step()
             print(f"[Profiler] stopped for rank {self.rank}")
             self.prof.stop()
+            if not self._forece_enable_for_one_step:
+                self.save()
 
     def save(self):
         if self.prof is not None and not self.saved:
-            if not os.path.exists(self.config.save_path):
-                os.makedirs(self.config.save_path)
-            save_file_name = f"/prof_start_{self.config.step_start}_end_{self.config.step_end}_rank_{self.rank}.json"
-            print(f"[Profiler] Saving trace to {self.config.save_path + save_file_name}")
-            self.prof.export_chrome_trace(self.config.save_path + save_file_name)
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
+            if self._forece_enable_for_one_step:
+                save_path = os.path.join(self.config.save_path, f"mini_batch_step{self._global_step}_" + timestamp)
+                self._global_step +=1
+            else:
+                save_path = os.path.join(self.config.save_path, timestamp)
+            if not os.path.exists(save_path):
+                os.makedirs(save_path, exist_ok=True)
+            save_file_name = f"/torch_profiler_rank_{self.rank}.json"
+            print(f"[Profiler] Saving trace to {save_path}")
+            self.prof.export_chrome_trace(save_path + save_file_name)
+            if self.profile_memory:
+                save_html_file_name = f"/torch_profiler_rank_{self.rank}.html"
+                self.prof.export_memory_timeline(save_path+save_html_file_name, device="cuda:0") # TODO: support more than rank 0
+                assert os.path.exists(save_path+save_html_file_name), f"Failed to save {save_path+save_html_file_name}"
+
+            assert os.path.exists(save_path + save_file_name), f"Failed to save trace file at {save_path + save_file_name}"
+
             self.enable = False
             self.saved = True
 
