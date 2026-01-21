@@ -744,31 +744,6 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         """
         return await self._make_async_request("resume_memory_occupation", {"tags": tags})
 
-    async def start_profile(self, tags: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        """start profile
-
-        Args:
-            tags (Optional[List[str]], optional): {'start_step'="15", 'num_steps':5}
-
-            TODO: Add args to, List of args to specify profile activities, 
-                which could be ["RPD", "MEM", "CUDA_PROFILER", "CPU", "GPU"] 
-
-        Returns:
-            Dict[str, Any]: Server response indicating profile status
-        """
-        print("starting start_profile ...")
-        return await self._make_async_request("start_profile", payload=tags)
-
-    async def stop_profile(self) -> dict[str, Any]:
-        """stop profile
-        Args:
-        Returns:
-            Dict[str, Any]: Server response indicating profile status
-        """
-        print("starting stop_profile ...")
-        return await self._make_async_request("stop_profile", payload=None)
-
-
     async def update_weights_from_tensor(
         self,
         req: UpdateWeightsFromTensorReqInput,
@@ -965,6 +940,27 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             image_data=image_data,
             lora_path=lora_path,
         )
+
+    async def start_profile(self, tags: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Start profile
+
+        Args:
+            tags (Optional[List[str]], optional): Arguments for profiling. Defaults to None.
+
+        Returns:
+            Dict[str, Any]: Server response indicating profile status
+        """
+        return await self._make_async_request("start_profile", payload=tags)
+
+    async def stop_profile(self) -> dict[str, Any]:
+        """Stop profile
+
+        Args:
+        Returns:
+            Dict[str, Any]: Server response indicating profile status
+        """
+        return await self._make_async_request("stop_profile", payload=None)
+
 
     async def abort_request(self, rid: str = "", abort_all: bool = False) -> dict[str, Any]:
         """Abort a request asynchronously.
